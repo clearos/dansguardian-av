@@ -1,0 +1,549 @@
+diff -ruN dansguardian-2.10.1.1/src/FatController.cpp dansguardian-2.10.1.1-epoll/src/FatController.cpp
+--- dansguardian-2.10.1.1/src/FatController.cpp	2009-04-28 06:37:10.000000000 -0400
++++ dansguardian-2.10.1.1-epoll/src/FatController.cpp	2012-06-14 12:27:55.750010441 -0400
+@@ -36,6 +36,7 @@
+ #include <fstream>
+ #include <sys/time.h>
+ #include <sys/poll.h>
++#include <sys/epoll.h>
+ #include <istream>
+ #include <map>
+ #include <sys/types.h>
+@@ -71,10 +72,16 @@
+ 
+ int numchildren;  // to keep count of our children
+ int busychildren;  // to keep count of our children
++int freechildren;  // to keep count of our children
+ int waitingfor;  // num procs waiting for to be preforked
+ int *childrenpids;  // so when one exits we know who
+ int *childrenstates;  // so we know what they're up to
+ struct pollfd *pids;
++struct epoll_event e_ev;
++struct epoll_event* revents;
++int epfd;
++int fds;
++int serversockfd;
+ UDSocket **childsockets;
+ int failurecount;
+ int serversocketcount;
+@@ -115,7 +122,7 @@
+ int prefork(int num);
+ 
+ // check child process is ready to start work
+-bool check_kid_readystatus(int tofind);
++bool check_kid_readystatus(int tofind, int* ssp);
+ // child process informs parent process that it is ready
+ int send_readystatus(UDSocket &pipe);
+ 
+@@ -127,7 +134,7 @@
+ bool getsock_fromparent(UDSocket &fd);
+ 
+ // add known info about a child to our info lists
+-void addchild(int pos, int fd, pid_t child_pid);
++void addchild(int fd, pid_t child_pid); // added PIP
+ // find ID of first non-busy child
+ int getfreechild();
+ // find an empty slot in our child info lists
+@@ -380,7 +387,23 @@
+ 			// close the end of the socketpair we don't need
+ 			close(sv[1]);
+ 			// add the child and its FD/PID to an empty child slot
+-			addchild(getchildslot(), sv[0], child_pid);
++			if ( sv[0] >= fds ) {
++				if (o.logchildprocs)
++					syslog(LOG_ERR, "Prefork - Child fd (%d) out of range (max %d)", sv[0], fds);	
++				close(sv[0]);
++				kill(child_pid, SIGTERM);
++				return(1);
++			}
++			addchild(sv[0], child_pid);
++			e_ev.data.fd = sv[0];
++			e_ev.events = EPOLLIN;
++			if(epoll_ctl( epfd, EPOLL_CTL_ADD, sv[0], &e_ev )) {
++#ifdef DGDEBUG
++				std::cout << "epoll_ctl errno:" << errno << " " << strerror(errno) << std::endl;
++#endif
++				syslog(LOG_ERR, "%s","Error registering child fd in epoll");
++				return(1);
++			}
+ #ifdef DGDEBUG
+ 			std::cout << "Preforked parent added child to list" << std::endl;
+ #endif
+@@ -422,15 +445,16 @@
+ 	}
+ 	// now close open socket pairs don't need
+ 
+-	for (int i = 0; i < o.max_children; i++) {
+-		if (pids[i].fd != -1) {
++	for (int i = 0; i < fds; i++) {
++		if (childrenstates[i] > -1) {
+ 			delete childsockets[i];
+ 		}
+ 	}
+ 	delete[]childrenpids;
+ 	delete[]childrenstates;
+ 	delete[]childsockets;
+-	delete[]pids;  // 4 deletes good, memory leaks bad
++	delete[]pids;
++        delete[]revents; // 5 deletes good, memory leaks bad
+ }
+ 
+ // send Ready signal to parent process over the socketpair (used in handle_connections)
+@@ -575,7 +599,7 @@
+ int getchildslot()
+ {
+ 	int i;
+-	for (i = 0; i < o.max_children; i++) {
++	for (i = 0; i < fds; i++) {
+ 		if (childrenpids[i] == -1) {
+ 			return i;
+ 		}
+@@ -584,16 +608,25 @@
+ }
+ 
+ // add the given child, including FD & PID, to the given slot in our lists
+-void addchild(int pos, int fd, pid_t child_pid)
++void addchild(int fd, pid_t child_pid)
+ {
+-	childrenpids[pos] = (int) child_pid;
+-	childrenstates[pos] = 4;  // busy waiting for init
++	if ( fd >= fds ) {
++		syslog(LOG_ERR, "Child fd (%d) out of range (max %d)", fd, fds);
++		return;
++	}
++	childrenpids[fd] = (int) child_pid;
++	childrenstates[fd] = 4;  // busy waiting for init
+ 	numchildren++;
+ 	busychildren++;
+ 	waitingfor++;
+-	pids[pos].fd = fd;
++	pids[fd].fd = fd;
+ 	UDSocket* sock = new UDSocket(fd);
+-	childsockets[pos] = sock;
++	childsockets[fd] = sock;
++#ifdef DGDEBUG
++	std::cout << "added child:" << fd << ":" << childrenpids[fd] << std::endl;
++#endif
++	if (o.logchildprocs)
++		syslog(LOG_ERR, "added child: fd: %d pid: %d", fd, child_pid);
+ }
+ 
+ // kill give number of non-busy children
+@@ -604,15 +637,23 @@
+ #endif
+ 	int i;
+ 	int count = 0;
+-	for (i = o.max_children - 1; i >= 0; i--) {
++	for (i = fds - 1; i >= 0; i--) {
+ 		if (childrenstates[i] == 0) {
+ 			kill(childrenpids[i], SIGTERM);
+ 			count++;
+ 			childrenstates[i] = -2;  // dieing
+ 			numchildren--;
++    	    		if(epoll_ctl( epfd, EPOLL_CTL_DEL, i, &e_ev )) {
++#ifdef DGDEBUG
++				std::cout << "epoll_ctl errno:" << errno << " " << strerror(errno) << std::endl;
++#endif
++	    		}
++			close(i);
+ 			delete childsockets[i];
+ 			childsockets[i] = NULL;
+ 			pids[i].fd = -1;
++			if (o.logchildprocs)
++				syslog(LOG_ERR, "deleted child: fd: %d pid: %d", i, childrenpids[i]);
+ 			if (count >= num) {
+ 				break;
+ 			}
+@@ -626,14 +667,17 @@
+ #ifdef DGDEBUG
+ 	std::cout << "killing all childs:" << std::endl;
+ #endif
+-	for (int i = o.max_children - 1; i >= 0; i--) {
++	for (int i = fds - 1; i >= 0; i--) {
+ 		if (childrenstates[i] >= 0) {
+ 			kill(childrenpids[i], SIGTERM);
+ 			childrenstates[i] = -2;  // dieing
+ 			numchildren--;
++			close(i);
+ 			delete childsockets[i];
+ 			childsockets[i] = NULL;
+ 			pids[i].fd = -1;
++			if (o.logchildprocs)
++				syslog(LOG_ERR, "deleted child: fd: %d pid: %d", i, childrenpids[i]);
+ 		}
+ 	}
+ }
+@@ -644,7 +688,7 @@
+ #ifdef DGDEBUG
+ 	std::cout << "huping all childs:" << std::endl;
+ #endif
+-	for (int i = o.max_children - 1; i >= 0; i--) {
++	for (int i = fds - 1; i >= 0; i--) {
+ 		if (childrenstates[i] >= 0) {
+ 			kill(childrenpids[i], SIGHUP);
+ 		}
+@@ -652,12 +696,13 @@
+ }
+ 
+ // attempt to receive the message from the child's send_readystatus call
+-bool check_kid_readystatus(int tofind)
++bool check_kid_readystatus(int tofind, int* ssp)
+ {
+ 	bool found = false;
+ 	char *buf = new char[5];
+ 	int rc = -1;  // for compiler warnings
+-	for (int f = 0; f < o.max_children; f++) {
++	for (int i = 0; i < tofind; i++) {
++		int f = revents[i].data.fd;
+ 
+ 		if (tofind < 1) {
+ 			break;  // no point looping through all if all found
+@@ -665,9 +710,14 @@
+ 		if (pids[f].fd == -1) {
+ 			continue;
+ 		}
+-		if ((pids[f].revents & POLLIN) > 0) {
++		if (childrenstates[f] == -4) { // is a server
++			childrenstates[f] = -5;
++			pids[f].revents = i;
++			*ssp = *ssp + 1;
++			continue;
++		}
++		if ((revents[i].events & EPOLLIN) > 0) {
+ 			if (childrenstates[f] < 0) {
+-				tofind--;
+ 				continue;
+ 			}
+ 			try {
+@@ -675,8 +725,10 @@
+ 			}
+ 			catch(std::exception & e) {
+ 				kill(childrenpids[f], SIGTERM);
++#ifdef DGDEBUG
++				std::cout << "check_kid_ready deleting child after failed getline" << f << ":" << childrenpids[f]  << std::endl;
++#endif
+ 				deletechild(childrenpids[f]);
+-				tofind--;
+ 				continue;
+ 			}
+ 			if (rc > 0) {
+@@ -686,12 +738,13 @@
+ 					}
+ 					childrenstates[f] = 0;
+ 					busychildren--;
+-					tofind--;
+ 				}
+ 			} else {	// child -> parent communications failure so kill it
+ 				kill(childrenpids[f], SIGTERM);
++#ifdef DGDEBUG
++				std::cout << "check_kid_ready deleting child after comms error" << f << ":"<< childrenpids[f]  << std::endl;
++#endif
+ 				deletechild(childrenpids[f]);
+-				tofind--;
+ 			}
+ 		}
+ 		if (childrenstates[f] == 0) {
+@@ -709,24 +762,32 @@
+ void deletechild(int child_pid)
+ {
+ 	int i;
+-	for (i = 0; i < o.max_children; i++) {
++	for (i = 0; i < fds; i++) {
+ 		if (childrenpids[i] == child_pid) {
++#ifdef DGDEBUG
++			std::cout << "deleting child:" << i << ":" << child_pid << std::endl;
++#endif
+ 			childrenpids[i] = -1;
+ 			// Delete a busy child
+ 			if (childrenstates[i] == 1)
+ 				busychildren--;
+ 			// Delete a child which isn't "ready" yet
+-			if (childrenstates[i] == 4)
+-			{
++			if (childrenstates[i] == 4) {
+ 				busychildren--;
+ 				waitingfor--;
+ 			}
+ 			// Common code for any non-"culled" child
+ 			if (childrenstates[i] != -2) {
+ 				numchildren--;
++      				try {
++                                	epoll_ctl(epfd, EPOLL_CTL_DEL, i, &e_ev);
++                                } catch (std::exception & e) {};
++				close(i);
+ 				delete childsockets[i];
+ 				childsockets[i] = NULL;
+ 				pids[i].fd = -1;
++				if (o.logchildprocs)
++					syslog(LOG_ERR, "deleted child: fd: %d pid: %d", i, childrenpids[i]);
+ 			}
+ 			childrenstates[i] = -1;  // unused
+ 			break;
+@@ -743,7 +804,7 @@
+ {				// check that there is 1 free done
+ 	// before calling
+ 	int i;
+-	for (i = 0; i < o.max_children; i++) {
++	for (i = 0; i < fds; i++) {
+ 		if (childrenstates[i] == 0) {	// not busy (free)
+ 			return i;
+ 		}
+@@ -759,6 +820,10 @@
+ 		childsockets[num]->writeToSockete((char*)&whichsock, 1, 0, 5, true);
+ 	} catch(std::exception & e) {
+ 		kill(childrenpids[num], SIGTERM);
++#ifdef DGDEBUG
++		std::cout << "telchild_accept deleting child after failed write:"
++			<< num << ":" << childrenpids[num] << std::endl;
++#endif
+ 		deletechild(childrenpids[num]);
+ 		return;
+ 	}
+@@ -769,6 +834,10 @@
+ 		childsockets[num]->readFromSocket(&buf, 1, 0, 5, false, true);
+ 	} catch(std::exception & e) {
+ 		kill(childrenpids[num], SIGTERM);
++#ifdef DGDEBUG
++		std::cout << "telchild_accept deleting child after failed read:"
++			<< num << ":" << childrenpids[num] << std::endl;
++#endif
+ 		deletechild(childrenpids[num]);
+ 		return;
+ 	}
+@@ -1669,7 +1738,7 @@
+ // also handles the various signalling options DG supports (reload config, flush cache, kill all processes etc.)
+ int fc_controlit()
+ {
+-	int rc, fds;
++	int rc;
+ 
+ 	o.lm.garbageCollect();
+ 
+@@ -2012,14 +2081,15 @@
+ 
+ 	numchildren = 0;  // to keep count of our children
+ 	busychildren = 0;  // to keep count of our children
+-	int freechildren = 0;  // to keep count of our children
++	freechildren = 0;  // to keep count of our children
+ 
+-	childrenpids = new int[o.max_children];  // so when one exits we know who
+-	childrenstates = new int[o.max_children];  // so we know what they're up to
+-	childsockets = new UDSocket* [o.max_children];
+-	fds = o.max_children + serversocketcount;
++	fds = o.max_children + serversocketcount + 6 + o.maxspare_children;
++	childrenpids = new int[fds];  // so when one exits we know who
++	childrenstates = new int[fds];  // so we know what they're up to
++	childsockets = new UDSocket* [fds];
+ 
+ 	pids = new struct pollfd[fds];
++    	revents = new struct epoll_event[fds]; 
+ 
+ 	int i;
+ 
+@@ -2028,22 +2098,34 @@
+ 
+ 	time(&tmaxspare);
+ 
++    	epfd = epoll_create(fds);
++
+ #ifdef DGDEBUG
+-	std::cout << "Parent process pid structs allocated" << std::endl;
++	std::cout << "Parent process pid structs allocated: fds = " << fds << std::endl;
+ #endif
+ 
+-	// store child fds...
+-	for (i = 0; i < o.max_children; i++) {
++	// initialise index arrays for all fds
++	for (i = 0; i < fds; i++) {
+ 		childrenpids[i] = -1;
+ 		childrenstates[i] = -1;
+ 		pids[i].fd = -1;
+-		pids[i].events = POLLIN;
+-
++		pids[i].events = POLLIN; // not now needed??
+ 	}
+-	// ...and server fds
+-	for (i = o.max_children; i < fds; i++) {
+-		pids[i].fd = serversockfds[i - o.max_children];
+-		pids[i].events = POLLIN;
++	// ...and set server fds entries and register with epoll
++	for (i = 0; i < serversocketcount; i++) {
++		int f = serversockfds[i];
++		pids[f].fd = f;
++		childrenpids[f] = -4;
++		childrenstates[f] = -4;
++		e_ev.data.fd = f;
++		e_ev.events = EPOLLIN;
++    		if(epoll_ctl( epfd, EPOLL_CTL_ADD, f, &e_ev )) {
++#ifdef DGDEBUG
++			std::cout << "epoll_ctl errno:" << errno << " " << strerror(errno) << std::endl;
++#endif
++			syslog(LOG_ERR, "%s","Error registering serversockfd in epoll");
++			return(1);
++		}
+ 	}
+ 
+ #ifdef DGDEBUG
+@@ -2122,12 +2205,8 @@
+ 		}
+ 
+ 		// Lets take the opportunity to clean up our dead children if any
+-		for (i = 0; i < fds; i++) {
+-			pids[i].revents = 0;
+-		}
+-		mopup_afterkids();
+-		rc = poll(pids, fds, 60 * 1000);
+ 		mopup_afterkids();
++		rc = epoll_wait(epfd, revents, fds, 60 * 1000);
+ 
+ 		if (rc < 0) {	// was an error
+ #ifdef DGDEBUG
+@@ -2143,18 +2222,12 @@
+ 			continue;  // then continue with the looping
+ 		}
+ 
+-		tofind = rc;
+-		if (rc > 0) {
+-			for (i = o.max_children; i < fds; i++) {
+-				if (pids[i].revents) {
+-					tofind--;
+-				}
+-			}
+-		}
++		mopup_afterkids();
+ 
++		tofind = rc;
++		int ssp = 0;  //to hold number of serversockfd entries in revents
+ 		if (tofind > 0) {
+-			check_kid_readystatus(tofind);
+-			mopup_afterkids();
++			check_kid_readystatus(rc, &ssp);
+ 		}
+ 
+ 		freechildren = numchildren - busychildren;
+@@ -2166,9 +2239,13 @@
+ 		std::cout << "waitingfor:" << waitingfor << std::endl << std::endl;
+ #endif
+ 
+-		if (rc > 0) {
+-			for (i = o.max_children; i < fds; i++) {
+-				if ((pids[i].revents & POLLIN) > 0) {
++		if (ssp > 0) {   // event on server socket
++		    for (i = 0; i < serversocketcount; i++) {
++			if (childrenstates[serversockfds[i]] == -5) {
++				childrenstates[serversockfds[i]] = -4;
++				int ev_off = pids[serversockfds[i]].revents;
++
++				if ((revents[ev_off].events & EPOLLIN) > 0) {
+ 					// socket ready to accept() a connection
+ 					failurecount = 0;  // something is clearly working so reset count
+ 					if (freechildren < 1 && numchildren < o.max_children) {
+@@ -2188,39 +2265,31 @@
+ 						continue;
+ 					}
+ 					if (freechildren > 0) {
++						int p_freechild = getfreechild();
++						if ( p_freechild > -1 ) {
+ #ifdef DGDEBUG
+-						std::cout<<"telling child to accept "<<(i-o.max_children)<<std::endl;
++							std::cout<<"telling child to accept "<<(i)<<std::endl;
+ #endif
+-						int childnum = getfreechild();
+-						if (childnum < 0)
+-						{
+-							// Oops! weren't actually any free children.
+-							// Not sure why as yet, but it seems this can
+-							// sometimes happen. :(  PRA 2009-03-11
+-							syslog(LOG_WARNING,
+-								"No free children from getfreechild(): numchildren = %d, busychildren = %d, waitingfor = %d",
+-								numchildren, busychildren, waitingfor
+-							);
+-							freechildren = 0;
++							//tellchild_accept(getfreechild(), i);
++							tellchild_accept(p_freechild, i);
++						} else {
++							syslog(LOG_ERR,
++								"freechildren gt 0 (%d) and no freechildren: busy %d, num %d ",
++								freechildren, busychildren, numchildren);	
+ 							usleep(1000);
+ 						}
+-						else
+-						{
+-							tellchild_accept(childnum, i - o.max_children);
+-							--freechildren;
+-						}
+ 					} else {
+ 						usleep(1000);
+ 					}
+ 				}
+-				else if (pids[i].revents) {
++				else if (revents[ev_off].events) {
+ 					ttg = true;
+ 					syslog(LOG_ERR, "Error with main listening socket.  Exiting.");
+ 					break;
+ 				}
+ 			}
+-			if (ttg)
+-				break;
++			if (ttg) break;
++		    }
+ 		}
+ 
+ 		if (freechildren < o.minspare_children && (waitingfor == 0) && numchildren < o.max_children) {
+@@ -2246,8 +2315,8 @@
+ 		}
+ 	}
+ 	cullchildren(numchildren);  // remove the fork pool of spare children
+-	for (int i = 0; i < o.max_children; i++) {
+-		if (pids[i].fd != -1) {
++	for (int i = 0; i < fds; i++) {
++		if (pids[i].fd > -1) {
+ 			delete childsockets[i];
+ 			childsockets[i] = NULL;
+ 		}
+@@ -2268,7 +2337,8 @@
+ 	delete[]childrenpids;
+ 	delete[]childrenstates;
+ 	delete[]childsockets;
+-	delete[]pids;  // 4 deletes good, memory leaks bad
++	delete[]pids;
++	delete[]revents;  // 5 deletes good, memory leaks bad
+ 
+ 	if (failurecount >= 30) {
+ 		syslog(LOG_ERR, "%s", "Exiting due to high failure count.");
+@@ -2279,9 +2349,11 @@
+ #ifdef DGDEBUG
+ 	std::cout << "Main parent process exiting." << std::endl;
+ #endif
++	syslog(LOG_ERR, "Main parent process exiting");
+ 
+ 	serversockets.deleteAll();
+ 	delete[] serversockfds; // be nice and neat
++	close(epfd);  // close epoll fd
+ 
+ 	memset(&sa, 0, sizeof(sa));
+ 	sa.sa_handler = SIG_DFL;
+diff -ruN dansguardian-2.10.1.1/src/IPList.cpp dansguardian-2.10.1.1-epoll/src/IPList.cpp
+--- dansguardian-2.10.1.1/src/IPList.cpp	2009-01-14 10:03:39.000000000 -0500
++++ dansguardian-2.10.1.1-epoll/src/IPList.cpp	2012-06-14 11:38:52.112003034 -0400
+@@ -81,7 +81,7 @@
+ 			hostnames.reset(new std::deque<String>);
+ 			hostnames->push_back(*host);
+ 		}
+-		for (std::deque<String>::iterator i = hostnames->begin(); i != hostnames->end(); ++i) 
++		for (std::deque<String>::const_iterator i = hostnames->begin(); i != hostnames->end(); ++i) 
+ 		{
+ 			if (std::binary_search(hostlist.begin(), hostlist.end(), *i))
+ 			{
+diff -ruN dansguardian-2.10.1.1/src/dansguardian.cpp dansguardian-2.10.1.1-epoll/src/dansguardian.cpp
+--- dansguardian-2.10.1.1/src/dansguardian.cpp	2009-01-14 10:03:30.000000000 -0500
++++ dansguardian-2.10.1.1-epoll/src/dansguardian.cpp	2012-06-12 15:33:50.758059896 -0400
+@@ -298,7 +298,7 @@
+ 		o.no_daemon = 1;
+ 	}
+ 
+-	if ((o.max_children + 6) > FD_SETSIZE) {
++	if ((o.max_children + 20) > 8000 ) {
+ 		syslog(LOG_ERR, "%s", "maxchildren option in dansguardian.conf has a value too high.");
+ 		std::cerr << "maxchildren option in dansguardian.conf has a value too high." << std::endl;
+ 		std::cerr << "Dammit Jim, I'm a filtering proxy, not a rabbit." << std::endl;

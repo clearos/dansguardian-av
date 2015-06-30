@@ -1,0 +1,7 @@
+/var/log/dansguardian-av/access.log {
+  missingok
+  sharedscripts
+  postrotate
+    /sbin/service dansguardian-av condrestart > /dev/null 2>&1
+  endscript
+}

@@ -1,0 +1,12 @@
+diff -rup dansguardian-2.10.1.1/src/authplugins/ntlm.cpp dansguardian-2.10.1.1-ntlmfix/src/authplugins/ntlm.cpp
+--- dansguardian-2.10.1.1/src/authplugins/ntlm.cpp	2008-11-18 06:27:04.000000000 -0500
++++ dansguardian-2.10.1.1-ntlmfix/src/authplugins/ntlm.cpp	2014-04-18 19:26:26.070540581 -0400
+@@ -27,6 +27,8 @@
+ #include "../FDTunnel.hpp"
+ #include "../OptionContainer.hpp"
+ 
++#include <cstddef>
++
+ #include <syslog.h>
+ 
+ #include <iconv.h>

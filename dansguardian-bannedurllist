@@ -1,0 +1,12 @@
+#URLs in banned list
+#Don't bother with the http:// or the www
+
+#The bannedurllist is for blocking PART of a site
+#The bannedsitelist is for blocking ALL of a site
+
+#To include additional files in this list use this example:
+#.Include</etc/dansguardian-av/anotherbannedurllist>
+
+#You can have multiple .Includes.
+
+#List other URLs to block:

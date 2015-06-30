@@ -1,0 +1,22 @@
+diff -rup dansguardian-2.10.1.1/src/contentscanners/icapscan.cpp dansguardian-gcc44/src/contentscanners/icapscan.cpp
+--- dansguardian-2.10.1.1/src/contentscanners/icapscan.cpp	2008-11-18 06:27:04.000000000 -0500
++++ dansguardian-gcc44/src/contentscanners/icapscan.cpp	2011-03-03 04:25:13.600289695 -0500
+@@ -36,6 +36,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <netdb.h>		// for gethostby
++#include <stdio.h>
+ 
+ 
+ // DEFINES
+diff -rup dansguardian-2.10.1.1/src/downloadmanagers/fancy.cpp dansguardian-gcc44/src/downloadmanagers/fancy.cpp
+--- dansguardian-2.10.1.1/src/downloadmanagers/fancy.cpp	2008-11-18 06:27:04.000000000 -0500
++++ dansguardian-gcc44/src/downloadmanagers/fancy.cpp	2011-03-03 04:25:32.581040608 -0500
+@@ -32,6 +32,7 @@
+ #include <unistd.h>
+ #include <iostream>
+ #include <math.h>
++#include <stdio.h>
+ 
+ 
+ // GLOBALS

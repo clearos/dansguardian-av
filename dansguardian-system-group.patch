@@ -1,0 +1,204 @@
+diff -rup dansguardian-2.10.1.1/src/Auth.cpp dansguardian-2.10.1.1-groups/src/Auth.cpp
+--- dansguardian-2.10.1.1/src/Auth.cpp	2008-11-18 07:27:04.000000000 -0400
++++ dansguardian-2.10.1.1-groups/src/Auth.cpp	2011-12-01 22:48:20.817926965 -0400
+@@ -32,6 +32,10 @@
+ #include <iostream>
+ #include <syslog.h>
+ 
++#include <sys/types.h>
++#include <pwd.h>
++#include <grp.h>
++
+ // GLOBALS
+ 
+ extern OptionContainer o;
+@@ -70,6 +74,57 @@ int AuthPlugin::determineGroup(std::stri
+ 	if (user.length() < 1 || user == "-") {
+ 		return DGAUTH_NOMATCH;
+ 	}
++
++	if (o.use_filter_system_groups == false) {
++		return this->determineFilterGroup(user, fg);
++	}
++
++	return this->determineSystemGroup(user, fg);
++}
++
++int AuthPlugin::determineSystemGroup(std::string &user, int &fg)
++{
++	struct group *  grpinfo;
++
++	/* Invalid user = default group.  We rely on Squid to
++	 * make sure user exists and is authenticated. */
++	if (getpwnam(user.c_str()) == NULL)
++		return DGAUTH_NOUSER;
++
++	for (int i = 0; i < o.filter_groups_list.getListLength(); i++) {
++		std::string item = o.filter_groups_list.getItemAtInt( i );
++
++#ifdef DGDEBUG
++		std::cout << "determineSystemGroup: check group: " << item << std::endl;
++#endif
++
++		grpinfo = getgrnam(item.c_str());
++		if (!grpinfo)
++			continue;
++
++			// find member
++			int j  = 0;
++			while (grpinfo->gr_mem[j]) {
++#ifdef DGDEBUG
++				std::cout << "determineSystemGroup: check member: " << grpinfo->gr_mem[j] << std::endl;
++#endif
++				if (user == grpinfo->gr_mem[j++]) {
++#ifdef DGDEBUG
++					std::cout << "determineSystemGroup: member of " << item << " is " << grpinfo->gr_mem[j-1] << std::endl;
++					std::cout << "determineSystemGroup: return filter group id " << i << std::endl;
++#endif
++					fg = i;
++
++					return DGAUTH_OK;
++				}
++			}
++		}
++
++		return DGAUTH_NOMATCH;
++}
++
++int AuthPlugin::determineFilterGroup(std::string &user, int &fg)
++{
+ 	String u(user);
+ 	u.toLower();  // since the filtergroupslist is read in in lowercase, we should do this.
+ 	user = u.toCharArray();  // also pass back to ConnectionHandler, so appears lowercase in logs
+diff -rup dansguardian-2.10.1.1/src/Auth.hpp dansguardian-2.10.1.1-groups/src/Auth.hpp
+--- dansguardian-2.10.1.1/src/Auth.hpp	2008-11-18 07:27:04.000000000 -0400
++++ dansguardian-2.10.1.1-groups/src/Auth.hpp	2011-12-01 22:49:00.332836319 -0400
+@@ -75,6 +75,9 @@ public:
+ 	// any < 0 - error
+ 	virtual int determineGroup(std::string &user, int &fg);
+ 
++	int determineSystemGroup(std::string &user, int &fg);
++	int determineFilterGroup(std::string &user, int &fg);
++
+ 	// is this a connection-based auth type, i.e. assume all subsequent requests on the pconn are from the same user?
+ 	bool is_connection_based;
+ 
+diff -rup dansguardian-2.10.1.1/src/FatController.cpp dansguardian-2.10.1.1-groups/src/FatController.cpp
+--- dansguardian-2.10.1.1/src/FatController.cpp	2009-04-28 06:37:10.000000000 -0400
++++ dansguardian-2.10.1.1-groups/src/FatController.cpp	2011-12-01 22:51:32.552896662 -0400
+@@ -2094,9 +2094,13 @@ int fc_controlit()
+ 				// if that fails it will bomb out
+ 			} else {
+ 				if (o.use_filter_groups_list) {
+-					o.filter_groups_list.reset();
+-					if (!o.doReadItemList(o.filter_groups_list_location.c_str(),&(o.filter_groups_list),"filtergroupslist",true))
++
++					if (o.use_filter_system_groups) {
++						if (!o.doReadItemList(o.filter_groups_list_location.c_str(),&(o.filter_groups_list),"filtergroupslist",true))
++							reloadconfig = true;  // filter groups problem...
++					} else if (!o.doReadItemList(o.filter_groups_list_location.c_str(),&(o.filter_groups_list),"filtersystemgroupslist",false,32)) {
+ 						reloadconfig = true;  // filter groups problem...
++					}
+ 				}
+ 				if (!reloadconfig) {
+ 					o.deletePlugins(o.csplugins);
+diff -rup dansguardian-2.10.1.1/src/OptionContainer.cpp dansguardian-2.10.1.1-groups/src/OptionContainer.cpp
+--- dansguardian-2.10.1.1/src/OptionContainer.cpp	2009-02-25 07:35:56.000000000 -0400
++++ dansguardian-2.10.1.1-groups/src/OptionContainer.cpp	2011-12-01 23:04:54.224954453 -0400
+@@ -482,6 +482,12 @@ bool OptionContainer::read(const char *f
+ 			use_xforwardedfor = false;
+ 		}
+ 
++		if (findoptionS("usefiltersystemgroups") == "on") {
++			use_filter_system_groups = true;
++		} else {
++			use_filter_system_groups = false;
++		}
++
+ 		filter_groups = findoptionI("filtergroups");
+ 
+ 		if (!realitycheck(filter_groups, 1, 0, "filtergroups")) {
+@@ -560,10 +566,25 @@ bool OptionContainer::read(const char *f
+ #ifdef DGDEBUG
+ 			std::cout << "Not using filtergroupslist" << std::endl;
+ #endif
+-		} else if (!doReadItemList(filter_groups_list_location.c_str(),&filter_groups_list,"filtergroupslist",true)) {
+-			return false;
+ 		} else {
+-			use_filter_groups_list = true;
++
++
++			if ( use_filter_system_groups ) {
++#ifdef DGDEBUG
++				std::cout << "filtergroup: use system groups" << std::endl;
++#endif
++				// do not sort the list and do not convert to lower case (filter == 32)
++				if (!doReadItemList(filter_groups_list_location.c_str(),&filter_groups_list,"filtergroupslist",false,false,32) )
++					return false;
++#ifdef DGDEBUG
++				std::cout << "filtergroup: successfully read system groups" << std::endl;
++#endif
++				use_filter_groups_list = true;
++			} else {
++				if (!doReadItemList(filter_groups_list_location.c_str(),&filter_groups_list,"filtergroupslist",true) )
++					return false;
++				use_filter_groups_list = true;
++	   		}
+ 		}
+ 
+ 		if (group_names_list_location.length() == 0) {
+@@ -620,7 +641,7 @@ bool OptionContainer::read(const char *f
+ 	return true;
+ }
+ 
+-bool OptionContainer::doReadItemList(const char* filename, ListContainer* lc, const char* fname, bool swsort) {
++bool OptionContainer::doReadItemList(const char* filename, ListContainer* lc, const char* fname, bool swsort, bool dosort, int filters) {
+ 	bool result = lc->readItemList(filename, false, 0);
+ 	if (!result) {
+ 		if (!is_daemonised) {
+@@ -629,10 +650,13 @@ bool OptionContainer::doReadItemList(con
+ 		syslog(LOG_ERR, "Error opening %s", fname);
+ 		return false;
+ 	}
+-	if (swsort)
+-		lc->doSort(true);
+-	else
+-		lc->doSort(false);
++	if (dosort) {
++		if (swsort)
++			lc->doSort(true);
++		else
++			lc->doSort(false);
++	}
++
+ 	return true;
+ }
+ 
+diff -rup dansguardian-2.10.1.1/src/OptionContainer.hpp dansguardian-2.10.1.1-groups/src/OptionContainer.hpp
+--- dansguardian-2.10.1.1/src/OptionContainer.hpp	2009-02-25 07:35:53.000000000 -0400
++++ dansguardian-2.10.1.1-groups/src/OptionContainer.hpp	2011-12-01 22:59:05.364938498 -0400
+@@ -91,6 +91,7 @@ public:
+ 	int max_ips;
+ 	bool recheck_replaced_urls;
+ 	bool use_filter_groups_list;
++	bool use_filter_system_groups;
+ 	bool use_group_names_list;
+ 	bool auth_needs_proxy_query;
+ 
+@@ -135,6 +136,7 @@ public:
+ 
+ 	HTMLTemplate html_template;
+ 	ListContainer filter_groups_list;
++	ListContainer filter_system_groups_list;
+ 	IPList exception_ip_list;
+ 	IPList banned_ip_list;
+ 	LanguageContainer language_list;
+@@ -172,7 +174,7 @@ public:
+ 	bool inBannedIPList(const std::string *ip, std::string *&host);
+ 	bool readFilterGroupConf();
+ 	// public so fc_controlit can reload filter group config files
+-	bool doReadItemList(const char *filename, ListContainer *lc, const char *fname, bool swsort);
++	bool doReadItemList(const char *filename, ListContainer *lc, const char *fname, bool swsort, bool dosort = true, int filters = 0);
+ 
+ private:
+ 	std::deque<std::string> conffile;

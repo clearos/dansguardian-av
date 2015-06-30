@@ -1,0 +1,13 @@
+[Unit]
+Description=DansGuardian Content Filter
+After=syslog.target network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/dansguardian-av.pid
+ExecStartPre=/usr/sbin/dansguardian-cleanup
+ExecStart=/usr/sbin/dansguardian-av -c /etc/dansguardian-av/dansguardian.conf
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target

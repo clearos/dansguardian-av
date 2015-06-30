@@ -1,0 +1,24 @@
+#domains in banned list
+#Don't bother with the www. or the http://
+
+#The bannedurllist is for blocking PART of a site
+#The bannedsitelist is for blocking ALL of a site
+
+#To include additional files in this list use this example:
+#.Include</etc/dansguardian-av/anotherbannedurllist>
+
+#You can have multiple .Includes.
+
+#List other sites to block:
+
+
+#Blanket Block.  To block all sites except those in the
+#exceptionsitelist file remove the # from the next line to leave
+#only a '**':
+#**
+
+
+#Blanket IP Block.  To block all sites specified only as an IP
+#remove the # from the next line to leave
+#only a '*ip':
+#*ip

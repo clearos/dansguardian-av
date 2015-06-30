@@ -1,0 +1,128 @@
+diff -rup dansguardian-2.10.1.1/src/contentscanners/clamdscan.cpp dansguardian-2.10.1.1-avscan/src/contentscanners/clamdscan.cpp
+--- dansguardian-2.10.1.1/src/contentscanners/clamdscan.cpp	2008-11-18 06:27:04.000000000 -0500
++++ dansguardian-2.10.1.1-avscan/src/contentscanners/clamdscan.cpp	2013-09-09 17:02:52.086288931 -0400
+@@ -191,6 +191,7 @@ int clamdinstance::scanFile(HTTPHeader *
+ 			lastmessage = "Archive not fully scanned: "+lastvirusname;
+ 			return DGCS_WARNING;
+ 		}
++		syslog(LOG_ERR, "clamdscan detected virus: %s", lastvirusname.toCharArray());
+ 		return DGCS_INFECTED;
+ 	}
+ 	// must be clean
+diff -rup dansguardian-2.10.1.1/src/contentscanners/kavdscan.cpp dansguardian-2.10.1.1-avscan/src/contentscanners/kavdscan.cpp
+--- dansguardian-2.10.1.1/src/contentscanners/kavdscan.cpp	2008-11-18 06:27:04.000000000 -0500
++++ dansguardian-2.10.1.1-avscan/src/contentscanners/kavdscan.cpp	2013-09-09 17:22:42.713288652 -0400
+@@ -109,11 +109,11 @@ int kavdinstance::scanFile(HTTPHeader * 
+ 	// file, and tell users to make sure the daemongroup option is friendly to
+ 	// the AV daemon's group membership.
+ 	// chmod can error with EINTR, ignore this?
+-	if (chmod(filename, S_IRGRP|S_IRUSR) != 0) {
++	if (chmod(filename, S_IRGRP|S_IRUSR|S_IROTH) != 0) {
+ 		syslog(LOG_ERR, "Could not change file ownership to give kavd read access: %s", strerror(errno));
+ 		return DGCS_SCANERROR;
+ 	};
+-	String command("SCAN bPQRSTUW ");
++	String command("CONTSCAN ");
+ 	if (pathprefix.length()) {
+ 		String fname(filename);
+ 		command += fname.after(pathprefix.toCharArray());
+@@ -134,29 +134,17 @@ int kavdinstance::scanFile(HTTPHeader * 
+ 		stripedsocks.close();
+ 		return DGCS_SCANERROR;
+ 	}
+-	char *buff = new char[4096];
+-	memset(buff, 0, 4096);
+-	int rc;
+-	try {
+-		// read kaspersky kavdscan (AV Enging Server) - format: 2xx greeting
+-		rc = stripedsocks.getLine(buff, 4096, o.content_scanner_timeout);
+-	} catch(std::exception & e) {
+-	}
+-	if (buff[0] != '2') {
+-		delete[]buff;
+-		stripedsocks.close();
+-		syslog(LOG_ERR, "%s", "kavdscan did not return ok");
+-		return DGCS_SCANERROR;
+-	}
+ 	try {
+ 		stripedsocks.writeString(command.toCharArray());
+ 	}
+ 	catch(std::exception & e) {
+-		delete[]buff;
+ 		stripedsocks.close();
+ 		syslog(LOG_ERR, "%s", "unable to write to kavdscan");
+ 		return DGCS_SCANERROR;
+ 	}
++	char *buff = new char[4096];
++	memset(buff, 0, 4096);
++	int rc;
+ 	try {
+ 		rc = stripedsocks.getLine(buff, 4096, o.content_scanner_timeout);
+ 	}
+@@ -167,46 +155,32 @@ int kavdinstance::scanFile(HTTPHeader * 
+ 		return DGCS_SCANERROR;
+ 	}
+ 	String reply(buff);
++	delete[]buff;
++	reply.removeWhiteSpace();
+ #ifdef DGDEBUG
+ 	std::cout << "Got from kavdscan:" << reply << std::endl;
+ #endif
+-	if (reply[0] == '2') {	// clean
+-#ifdef DGDEBUG
+-		std::cerr << "kavdscan - clean" << std::endl;
+-#endif
+-		delete[]buff;
+-		stripedsocks.close();
+-		return DGCS_CLEAN;
++	stripedsocks.close();
++	if (reply.endsWith("ERROR")) {
++		lastmessage = reply;
++		syslog(LOG_ERR, "kavdscan error: %s", reply.toCharArray());
++		return DGCS_SCANERROR;
+ 	}
+-	if (reply.startsWith("322")) {	// infected
+-		// patch to handle multiple virii in kavd response
+-		// originally submitted by cahya <littlecahya@yahoo.de>
+-		while(reply[0] != '2' && rc != 0) {
+-			reply.removeWhiteSpace();
+-			lastvirusname = lastvirusname + " " + reply.after("322-").before(" ");
+-			try {
+-				rc = stripedsocks.getLine(buff, 4096, o.content_scanner_timeout);
+-			}
+-			catch(std::exception & e) {
+-				delete[]buff;
+-				stripedsocks.close();
+-				syslog(LOG_ERR, "%s", "Error reading kavdscan socket");
+-				return DGCS_SCANERROR;
+-			}
+-			reply = buff;
++	else if (reply.endsWith("FOUND")) {
++		lastvirusname = reply.after(": ").before(" FOUND");
++		// format is:
++		// /foo/path/file: foovirus FOUND
+ #ifdef DGDEBUG
+-			std::cout << "Got from kavdscan:" << reply << std::endl;
++		std::cerr << "kavdscan detected INFECTED! with: " << lastvirusname << std::endl;
+ #endif
+-		}
+-		std::cout << "lastvirusname: " << lastvirusname << std::endl;
+-		delete[]buff;
+-		stripedsocks.close();
+-		// format: 322 nastyvirus blah
++		syslog(LOG_ERR, "kavdscan detected virus: %s", lastvirusname.toCharArray());
+ 		return DGCS_INFECTED;
+ 	}
+-	delete[]buff;
+-	stripedsocks.close();
+-	// must be an error then
+-	lastmessage = reply;
+-	return DGCS_SCANERROR;
++	// must be clean
++	// Note: we should really check what the output of a "clean" message actually looks like,
++	// and check explicitly for that, but the ClamD documentation is sparse on output formats.
++#ifdef DGDEBUG
++	std::cerr << "kavdscan - he say yes (clean)" << std::endl;
++#endif
++	return DGCS_CLEAN;
+ }

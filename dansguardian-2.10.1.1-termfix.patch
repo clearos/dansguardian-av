@@ -1,0 +1,16 @@
+diff -ruN dansguardian-2.10.1.1/src/FatController.cpp dansguardian-2.10.1.1-termfix/src/FatController.cpp
+--- dansguardian-2.10.1.1/src/FatController.cpp	2013-03-21 01:44:16.278885364 -0400
++++ dansguardian-2.10.1.1-termfix/src/FatController.cpp	2013-03-21 01:44:50.918884509 -0400
+@@ -2318,12 +2318,6 @@
+ 		}
+ 	}
+ 	cullchildren(numchildren);  // remove the fork pool of spare children
+-	for (int i = 0; i < fds; i++) {
+-		if (pids[i].fd > -1) {
+-			delete childsockets[i];
+-			childsockets[i] = NULL;
+-		}
+-	}
+ 	if (numchildren > 0) {
+ 		hup_allchildren();
+ 		sleep(2);  // give them a small chance to exit nicely before we force
